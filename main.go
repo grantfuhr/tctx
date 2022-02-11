@@ -1,23 +1,28 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/urfave/cli/v2"
 
 	"github.com/jlegrone/tctx/internal/config"
+	"github.com/jlegrone/tctx/internal/xbar"
 )
 
 const (
 	configPathFlag                 = "config_path"
 	contextNameFlag                = "context"
 	addressFlag                    = "address"
+	webAddressFlag                 = "web_address"
 	namespaceFlag                  = "namespace"
 	tlsCertFlag                    = "tls_cert_path"
 	tlsKeyFlag                     = "tls_key_path"
@@ -26,16 +31,17 @@ const (
 	tlsServerNameFlag              = "tls_server_name"
 	headersProviderPluginFlag      = "headers_provider_plugin"
 	dataConverterPluginFlag        = "data_converter_plugin"
+	envFlag                        = "env"
 )
 
-var (
-	contextFlag = &cli.StringFlag{
+func getContextFlag(required bool) *cli.StringFlag {
+	return &cli.StringFlag{
 		Name:     contextNameFlag,
 		Aliases:  []string{"c"},
 		Usage:    "name of the context",
-		Required: true,
+		Required: required,
 	}
-)
+}
 
 func getConfigPath(userConfigDir string) string {
 	return filepath.Join(userConfigDir, "tctx", "config.json")
@@ -43,7 +49,7 @@ func getConfigPath(userConfigDir string) string {
 
 func getContextAndNamespaceFlags(required bool, defaultNamespace string) []cli.Flag {
 	return []cli.Flag{
-		contextFlag,
+		getContextFlag(true),
 		&cli.StringFlag{
 			Name:     namespaceFlag,
 			Aliases:  []string{"ns"},
@@ -62,6 +68,11 @@ func getAddOrUpdateFlags(required bool) []cli.Flag {
 			Aliases:  []string{"ad"},
 			Usage:    "host:port for Temporal frontend service",
 			Required: required,
+		},
+		&cli.StringFlag{
+			Name:    webAddressFlag,
+			Aliases: []string{"wad"},
+			Usage:   "URL for Temporal web UI",
 		},
 		&cli.StringFlag{
 			Name:  tlsCertFlag,
@@ -93,6 +104,10 @@ func getAddOrUpdateFlags(required bool) []cli.Flag {
 			Aliases: []string{"dcp"},
 			Usage:   "data converter plugin executable name",
 		},
+		&cli.StringSliceFlag{
+			Name:  envFlag,
+			Usage: "arbitrary environment variables to be set in this context, in the form of KEY=value",
+		},
 	)
 }
 
@@ -109,20 +124,40 @@ func main() {
 	}
 }
 
-func configFromFlags(c *cli.Context) (configPath string, contextName string, clusterConfig *config.ClusterConfig) {
+func configFromFlags(c *cli.Context) (configPath string, contextName string, clusterConfig *config.ClusterConfig, err error) {
+	additionalEnvVars, err := parseAdditionalEnvVars(c.StringSlice(envFlag))
 	return c.String(configPathFlag), c.String(contextNameFlag), &config.ClusterConfig{
-		Address:         c.String(addressFlag),
-		Namespace:       c.String(namespaceFlag),
-		HeadersProvider: c.String(headersProviderPluginFlag),
-		DataConverter:   c.String(dataConverterPluginFlag),
-		TLS: &config.TLSConfig{
-			CertPath:                c.String(tlsCertFlag),
-			KeyPath:                 c.String(tlsKeyFlag),
-			CACertPath:              c.String(tlsCAFlag),
-			DisableHostVerification: c.Bool(tlsDisableHostVerificationFlag),
-			ServerName:              c.String(tlsServerNameFlag),
+			Address:         c.String(addressFlag),
+			WebAddress:      c.String(webAddressFlag),
+			Namespace:       c.String(namespaceFlag),
+			HeadersProvider: c.String(headersProviderPluginFlag),
+			DataConverter:   c.String(dataConverterPluginFlag),
+			TLS: &config.TLSConfig{
+				CertPath:                c.String(tlsCertFlag),
+				KeyPath:                 c.String(tlsKeyFlag),
+				CACertPath:              c.String(tlsCAFlag),
+				DisableHostVerification: c.Bool(tlsDisableHostVerificationFlag),
+				ServerName:              c.String(tlsServerNameFlag),
+			},
+			Environment: additionalEnvVars,
 		},
+		err
+}
+
+func parseAdditionalEnvVars(input []string) (additional map[string]string, err error) {
+	envVars := make(map[string]string)
+	if input == nil {
+		return nil, nil
 	}
+	for _, kv := range input {
+		// Additional Environment Variables are expected to be of form KEY=value
+		kvSplit := strings.Split(kv, "=")
+		if len(kvSplit) == 0 || len(kvSplit) == 1 {
+			return nil, fmt.Errorf("Unable to parse environment variables %v \nEnter environment variables in the following format: --env KEY=value --env FOO=bar", input)
+		}
+		envVars[kvSplit[0]] = kvSplit[1]
+	}
+	return envVars, nil
 }
 
 func switchContexts(w io.Writer, rw *config.FSReaderWriter, contextName, namespace string) error {
@@ -159,7 +194,10 @@ func newApp(configFile string) *cli.App {
 				Usage: "add a new context",
 				Flags: getAddOrUpdateFlags(true),
 				Action: func(c *cli.Context) error {
-					path, name, cfg := configFromFlags(c)
+					path, name, cfg, err := configFromFlags(c)
+					if err != nil {
+						return err
+					}
 
 					rw, err := config.NewReaderWriter(path)
 					if err != nil {
@@ -184,7 +222,10 @@ func newApp(configFile string) *cli.App {
 				Usage: "update an existing context",
 				Flags: getAddOrUpdateFlags(false),
 				Action: func(c *cli.Context) error {
-					path, name, newCfg := configFromFlags(c)
+					path, name, newCfg, err := configFromFlags(c)
+					if err != nil {
+						return err
+					}
 
 					rw, err := config.NewReaderWriter(path)
 					if err != nil {
@@ -208,7 +249,7 @@ func newApp(configFile string) *cli.App {
 				Aliases: []string{},
 				Usage:   "remove a context",
 				Flags: []cli.Flag{
-					contextFlag,
+					getContextFlag(true),
 				},
 				Action: func(c *cli.Context) error {
 					rw, err := config.NewReaderWriter(c.String(configPathFlag))
@@ -286,10 +327,49 @@ func newApp(configFile string) *cli.App {
 				},
 			},
 			{
+				Name:   "tctxbar",
+				Hidden: true,
+				Flags: []cli.Flag{
+					&xbar.ShowClusterFlag,
+					&xbar.ShowNamespaceFlag,
+				},
+				Action: func(c *cli.Context) error {
+					executablePath, err := os.Executable()
+					if err != nil {
+						return err
+					}
+
+					rw, err := config.NewReaderWriter(c.String(configPathFlag))
+					if err != nil {
+						return err
+					}
+					cfg, err := rw.GetAllContexts()
+					if err != nil {
+						return err
+					}
+
+					// Define a timeout to avoid blocking menu rendering on querying
+					// Temporal cluster state.
+					ctx, cancel := context.WithTimeout(c.Context, time.Second)
+					defer cancel()
+
+					return xbar.Render(ctx, &xbar.Options{
+						Config:        cfg,
+						TctxPath:      executablePath,
+						TctlPath:      "tctl",
+						ShowCluster:   c.Bool(xbar.ShowClusterFlag.Name),
+						ShowNamespace: c.Bool(xbar.ShowNamespaceFlag.Name),
+					})
+				},
+			},
+			{
 				Name:      "exec",
 				Aliases:   []string{},
 				ArgsUsage: "-- <command> [args]",
 				Usage:     "execute a command with temporal environment variables set",
+				Flags: []cli.Flag{
+					getContextFlag(false),
+				},
 				Action: func(c *cli.Context) error {
 					if c.Args().Len() == 0 {
 						return cli.ShowCommandHelp(c, "exec")
@@ -300,7 +380,15 @@ func newApp(configFile string) *cli.App {
 						return err
 					}
 
-					cfg, err := rw.GetActiveContext()
+					contextName := c.String(contextNameFlag)
+					if contextName == "" {
+						contextName, err = rw.GetActiveContextName()
+						if err != nil {
+							return err
+						}
+					}
+
+					cfg, err := rw.GetContext(contextName)
 					if err != nil {
 						return err
 					}
@@ -319,6 +407,9 @@ func newApp(configFile string) *cli.App {
 						"TEMPORAL_CLI_PLUGIN_HEADERS_PROVIDER": cfg.HeadersProvider,
 						"TEMPORAL_CLI_PLUGIN_DATA_CONVERTER":   cfg.DataConverter,
 					} {
+						env = append(env, fmt.Sprintf("%s=%s", k, v))
+					}
+					for k, v := range cfg.Environment {
 						env = append(env, fmt.Sprintf("%s=%s", k, v))
 					}
 

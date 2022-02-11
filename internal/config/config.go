@@ -24,6 +24,8 @@ type TLSConfig struct {
 type ClusterConfig struct {
 	// host:port for Temporal frontend service
 	Address string `json:"address"`
+	// Web UI Link
+	WebAddress string `json:"webAddress"`
 	// Temporal workflow namespace (default: "default")
 	Namespace string `json:"namespace"`
 	// Headers provider plugin executable name
@@ -31,6 +33,8 @@ type ClusterConfig struct {
 	// Data converter plugin executable name
 	DataConverter string     `json:"dataConverter"`
 	TLS           *TLSConfig `json:"tls,omitempty"`
+	// Any additional environment variables that are needed
+	Environment map[string]string `json:"additional,omitempty"`
 }
 
 func (c ClusterConfig) GetTLS() TLSConfig {
@@ -111,6 +115,22 @@ func (f *FSReaderWriter) GetActiveContext() (*ClusterConfig, error) {
 	return nil, fmt.Errorf("context does not exist")
 }
 
+func (f *FSReaderWriter) GetActiveContextName() (string, error) {
+	cfg, err := f.GetAllContexts()
+	if err != nil {
+		return "", err
+	}
+
+	if len(cfg.Contexts) == 0 {
+		return "", fmt.Errorf("no contexts exist: create one with `tctx add`")
+	}
+
+	if cfg.ActiveContext == "" {
+		return "", fmt.Errorf("no active context: set one with `tctx use`")
+	}
+	return cfg.ActiveContext, nil
+}
+
 func (f *FSReaderWriter) GetAllContexts() (*Config, error) {
 	file, err := os.Open(f.path)
 	if err != nil {
@@ -150,6 +170,14 @@ func (f *FSReaderWriter) UpsertContext(name string, new *ClusterConfig) error {
 		}
 		if new.TLS != nil {
 			existing.TLS = new.TLS
+		}
+		if new.Environment != nil {
+			if existing.Environment == nil {
+				existing.Environment = make(map[string]string)
+			}
+			for k, v := range new.Environment {
+				existing.Environment[k] = v
+			}
 		}
 	} else {
 		// Add a new entry
